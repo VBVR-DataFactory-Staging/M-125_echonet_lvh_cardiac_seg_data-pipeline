@@ -1,90 +1,80 @@
-# M-041 — Surgical Phase Recognition
+# M-125 — EchoNet-LVH Cardiac-Cycle Prediction
 
-MultiBypass140 laparoscopic Roux-en-Y surgical phase recognition.
+Stanford AIMI **EchoNet-LVH** parasternal-long-axis echocardiograms turned into
+a video-prediction task: given a single end-diastolic (ED) frame, predict the
+full cardiac cycle (systolic contraction → diastolic re-expansion).
 
 This repository is part of the Med-VR data-pipeline suite for the VBVR
-(Very Big Video Reasoning) benchmark. It produces standardized video-
-reasoning task samples from the underlying raw medical dataset.
+(Very Big Video Reasoning) benchmark.
 
-## Task
+## Task design (Option B — Cycle Prediction, C5 tab)
+
+Aligned with **M-126** (EchoNet-Pediatric segmentation/cycle) and **M-130**
+(CAMUS heartbeat-cycle prediction).
 
 **Prompt shown to the model**:
 
-> This is a laparoscopic Roux-en-Y gastric bypass surgery video. Identify the current surgical phase at every frame. The full-frame border changes color according to the phase (preparation: gray; gastric pouch creation: red; omentum division: orange; mesenteric defect closure: yellow; jejunal transection: green; jejuno-jejunostomy: cyan; gastro-jejunostomy: blue; anastomosis test: purple; cleaning and hemostasis: magenta; instrument removal: brown), and a surgical-progress bar is shown at the bottom.
+> Given this Stanford EchoNet-LVH parasternal-long-axis echocardiogram frame at
+> end-diastole (left ventricle maximally filled), predict one complete cardiac
+> cycle showing systolic contraction (ventricular walls thicken and the
+> left-ventricular chamber shrinks) followed by diastolic relaxation (walls
+> thin and the chamber re-expands). Preserve the LV chamber geometry, the
+> interventricular septum (IVS) and posterior wall (LVPW), and the overall
+> acoustic-window shape. The generated video should end at approximately the
+> same end-diastolic state it started from. No text overlays in the generated
+> video.
+
+**Per-sample 7-file layout**:
+```
+echonet_lvh_cardiac_cycle_prediction_task/echonet_lvh_<NNNNN>/
+├── first_frame.png      ED frame, 512x512
+├── final_frame.png      Last frame of GT cycle (≈ ED again)
+├── prompt.txt           the prompt above
+├── first_video.mp4      ED frame held for 48 frames (seed loop)
+├── last_video.mp4       == ground_truth.mp4
+├── ground_truth.mp4     full cardiac cycle, 48 frames @ 16 fps
+└── metadata.json        LV measurements (IVSd/LVIDd/LVIDs/LVPWd cm), split, etc.
+```
 
 ## S3 Raw Data
 
 ```
-s3://med-vr-datasets/M-041_MultiBypass140/raw/
+s3://med-vr-datasets/M-125/echonet_lvh/echonetlvh/EchoNet-LVH.zip   (73.79 GB)
+  ├── Batch1/  (3,150 .avi)
+  ├── Batch2/  (2,986 .avi)
+  ├── Batch3/  (2,908 .avi)
+  ├── Batch4/  (2,960 .avi)
+  └── MeasurementsList.csv   (per-video LV measurements + split + ED/ES frame)
 ```
 
-## Quick Start
+The downloader **streams individual .avi members** via boto3 range fetch +
+zlib inflate (`src/download/downloader.py`). It deliberately does **not** sync
+the full 73 GB zip — EC2 disk footprint stays around `num_samples * 10 MB`.
+
+## Pipeline notes
+
+- ED frame is taken from `MeasurementsList.csv` (the `LVIDd` row's `Frame`).
+- Cycle length is approximated as `2 * (ES - ED)` when both are present, else
+  ~1 s of native FPS, clamped to [12, 60] frames.
+- All output videos are 512×512 H.264 yuv420p MP4 (Wan2.2-compatible).
+
+## Local quickstart
 
 ```bash
+python3 -m venv venv && source venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 
-# Generate samples (downloads raw from S3 on first run)
-python examples/generate.py
-
-# Generate only N samples
-python examples/generate.py --num-samples 10
-
-# Custom output directory
-python examples/generate.py --output data/my_output
+# Stream 3 samples from S3, write to data/questions/
+python examples/generate.py --num-samples 3 --output data/questions
 ```
 
-## Output Layout
+## EC2 launch (production)
 
+Use the standard harness:
 ```
-data/questions/surgical_phase_recognition_task/
-├── task_0000/
-│   ├── first_frame.png
-│   ├── final_frame.png
-│   ├── first_video.mp4
-│   ├── last_video.mp4
-│   ├── ground_truth.mp4
-│   ├── prompt.txt
-│   └── metadata.json
-├── task_0001/
-└── ...
+./.claude/skills/aws-ec2/launch M-125_echonet_lvh_cardiac_seg_data-pipeline --big
 ```
 
-## Example Output
-
-See [`examples/example_output/`](examples/example_output/) for 2 reference
-samples committed alongside the code.
-
-## Configuration
-
-`src/pipeline/config.py` (`TaskConfig`):
-
-| Field | Default | Description |
-|---|---|---|
-| `domain` | `"surgical_phase_recognition"` | Task domain string used in output paths. |
-| `s3_bucket` | `"med-vr-datasets"` | S3 bucket containing raw data. |
-| `s3_prefix` | `"M-041_MultiBypass140/raw/"` | S3 key prefix for raw data. |
-| `fps` | `25` | Output video FPS. |
-| `raw_dir` | `Path("raw")` | Local raw cache directory. |
-| `num_samples` | `None` | Max samples (None = all). |
-
-## Repository Structure
-
-```
-M-041_multibypass_phase_recognition_data-pipeline/
-├── core/                ← shared pipeline framework (verbatim)
-├── eval/                ← shared evaluation utilities
-├── src/
-│   ├── download/
-│   │   └── downloader.py   ← S3 raw-data downloader
-│   └── pipeline/
-│       ├── config.py        ← task config
-│       ├── pipeline.py      ← TaskPipeline
-│       ├── transforms.py    ← visualization helpers (shim)
-│       └── _phase2/         ← vendored phase2 prototype logic
-├── examples/
-│   ├── generate.py
-│   └── example_output/      ← committed reference samples
-├── requirements.txt
-├── README.md
-└── LICENSE
-```
+(Pipeline is `--big` because it reads from a 73 GB ZIP. We don't sync the zip,
+so a c5.4xlarge with 500 GB EBS is plenty.)
